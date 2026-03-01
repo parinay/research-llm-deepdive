@@ -4,11 +4,11 @@ file_organizer.py
 Recursively organizes a messy folder by:
 
   1. Categorizing every file by extension into named subfolders
-     (Images, Documents, Archives, Installables, Logs, …).
+     (Images, Documents, Archives, Installables, Logs, ...).
   2. Renaming each file to <clean-stem>_<YYYY-MM-DD_HH-MM-SS><ext>
      using the file's creation (or modification) timestamp.
   3. Detecting duplicates via MD5 fingerprinting and moving them into
-     a per-category Duplicates/ subfolder — nothing is ever deleted.
+     a per-category Duplicates/ subfolder - nothing is ever deleted.
   4. Previewing all planned changes with --dry-run before touching files.
 
 Usage
@@ -25,41 +25,44 @@ import argparse
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Dict, List, Optional, Set
+
+from utils import remove_empty_dirs
 
 # ---------------------------------------------------------------------------
-# Category map: folder name → lowercase extensions that belong to it.
-# Files whose extension isn't listed here land in "Others".
+# Category map: folder name -> lowercase extensions that belong to it.
+# Files whose extension is not listed here land in "Others".
 # ---------------------------------------------------------------------------
-CATEGORIES: dict[str, list[str]] = {
+CATEGORIES: Dict[str, List[str]] = {
     "Images":       [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg", ".webp", ".jfif"],
     "Videos":       [".mp4", ".mov", ".avi", ".mkv", ".flv", ".wmv"],
     "Documents":    [".pdf", ".doc", ".docx", ".txt", ".xls", ".xlsx", ".pptx", ".ppt",
                      ".csv", ".epub", ".md", ".odt", ".arff", ".ics", ".html", ".htm"],
     "Audio":        [".mp3", ".wav", ".aac", ".flac", ".ogg"],
     "Archives":     [".zip", ".tar", ".rar", ".7z", ".tgz", ".gz", ".bz2"],
-    "Code":         [".py", ".js", ".ts", ".css", ".json", ".sh", ".cpp", ".c", ".java", ".go", ".rb"],
+    "Code":         [".py", ".js", ".ts", ".css", ".json", ".sh", ".cpp", ".c",
+                     ".java", ".go", ".rb"],
     "Installables": [".exe", ".msi", ".msix", ".msp", ".dmg", ".pkg", ".deb", ".rpm",
                      ".vbox-extpack"],
     "Logs":         [".log", ".slack"],
 }
 
-# Reverse lookup built once at import time for O(1) ext → category resolution.
-_EXT_TO_CATEGORY: dict[str, str] = {
+# Reverse lookup built once at import time for O(1) ext -> category resolution.
+_EXT_TO_CATEGORY: Dict[str, str] = {
     ext: cat for cat, exts in CATEGORIES.items() for ext in exts
 }
 
 # Compound extensions that os.path.splitext cannot split correctly.
-_COMPOUND_EXTS: tuple[str, ...] = (".tar.gz", ".tar.bz2")
+_COMPOUND_EXTS = (".tar.gz", ".tar.bz2")
 
 # Subfolder name used for detected duplicates inside each category folder.
 DUPLICATES_DIR = "Duplicates"
 
 # Hashing tuning: files above SAMPLE_THRESHOLD are fingerprinted by reading
 # SAMPLE_SIZE bytes from the start and end plus the exact byte count.
-# This keeps large-file hashing fast over slow virtual drives (e.g. WSL↔Windows).
 SAMPLE_THRESHOLD = 10 * 1024 * 1024   # 10 MB
-SAMPLE_SIZE      = 512 * 1024          # 512 KB per sampled region
-CHUNK_SIZE       = 8_192               # streaming read size for small files
+SAMPLE_SIZE = 512 * 1024               # 512 KB per sampled region
+CHUNK_SIZE = 8_192                     # streaming read size for small files
 
 
 # ---------------------------------------------------------------------------
@@ -74,11 +77,21 @@ class Stats:
     duplicates: int = 0
 
 
+@dataclass
+class _RunContext:
+    """Shared mutable state passed through the processing pipeline."""
+    folder: str
+    dry_run: bool
+    seen_hashes: Dict[str, str]
+    created_dirs: Set[str]
+    stats: Stats
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _split_stem_ext(filename: str) -> tuple[str, str]:
+def _split_stem_ext(filename: str):
     """Return (stem, ext), correctly handling compound extensions like .tar.gz."""
     lower = filename.lower()
     for compound in _COMPOUND_EXTS:
@@ -104,32 +117,31 @@ def get_category(filepath: str) -> str:
     return _EXT_TO_CATEGORY.get(ext, "Others")
 
 
-def get_file_hash(filepath: str) -> str | None:
+def get_file_hash(filepath: str) -> Optional[str]:
     """
     Return an MD5 hex digest used for duplicate detection.
 
     Small files are hashed in full. Large files are fingerprinted from
-    start + end chunks plus their exact byte count — fast enough for
-    multi-GB files while still distinguishing real duplicates.
+    start + end chunks plus their exact byte count.
     Returns None on any I/O error so the caller treats the file as unique.
     """
     hasher = hashlib.md5()
     try:
-        with open(filepath, "rb") as f:
-            # Seek to end for size in one syscall — avoids a separate
+        with open(filepath, "rb") as file_obj:
+            # Seek to end for size in one syscall - avoids a separate
             # os.path.getsize() call and the TOCTOU race it would introduce.
-            size = f.seek(0, 2)
-            f.seek(0)
+            size = file_obj.seek(0, 2)
+            file_obj.seek(0)
             if size <= SAMPLE_THRESHOLD:
-                while chunk := f.read(CHUNK_SIZE):
+                while chunk := file_obj.read(CHUNK_SIZE):
                     hasher.update(chunk)
             else:
-                hasher.update(f.read(SAMPLE_SIZE))
-                hasher.update(size.to_bytes(8, "little"))  # size guards against same-content, different-length collisions
-                f.seek(-SAMPLE_SIZE, 2)
-                hasher.update(f.read(SAMPLE_SIZE))
-    except OSError as e:
-        print(f"  Warning: cannot hash '{filepath}': {e}")
+                hasher.update(file_obj.read(SAMPLE_SIZE))
+                hasher.update(size.to_bytes(8, "little"))
+                file_obj.seek(-SAMPLE_SIZE, 2)
+                hasher.update(file_obj.read(SAMPLE_SIZE))
+    except OSError as err:
+        print(f"  Warning: cannot hash '{filepath}': {err}")
         return None
     return hasher.hexdigest()
 
@@ -172,7 +184,7 @@ def make_new_filename(filepath: str) -> str:
 
 def unique_path(path: str) -> str:
     """
-    Return a collision-free path by appending _1, _2, … when necessary.
+    Return a collision-free path by appending _1, _2, ... when necessary.
 
     Only called during live runs (not dry-run) so all existence checks
     reflect the real filesystem state.
@@ -186,13 +198,58 @@ def unique_path(path: str) -> str:
     return f"{base}_{i}{ext}"
 
 
-def remove_empty_dirs(folder: str) -> None:
-    """Remove subdirectories that became empty after files were moved out."""
-    for root, _dirs, _files in os.walk(folder, topdown=False):
-        if root == folder:
-            continue  # never remove the root itself
-        if not os.listdir(root):
-            os.rmdir(root)
+def _log_action(
+        filepath: str,
+        dest: str,
+        folder: str,
+        is_dup: bool,
+        already_in_place: bool) -> None:
+    """Print the move/rename action being taken for a file."""
+    tag = "[DUP]  " if is_dup else "       "
+    action = "Rename" if already_in_place else "Move+Rename"
+    print(f"  {tag}{action}: {os.path.basename(filepath)}")
+    print(f"          -> {os.path.relpath(dest, folder)}")
+
+
+def _process_file(filepath: str, ctx: _RunContext) -> None:
+    """
+    Categorize, fingerprint, rename and move a single file.
+
+    Updates ctx.seen_hashes, ctx.created_dirs, and ctx.stats in place.
+    """
+    category = get_category(filepath)
+    file_hash = get_file_hash(filepath)
+    is_dup = file_hash is not None and file_hash in ctx.seen_hashes
+    if file_hash and not is_dup:
+        ctx.seen_hashes[file_hash] = filepath
+
+    dest_dir = (
+        os.path.join(ctx.folder, category, DUPLICATES_DIR)
+        if is_dup
+        else os.path.join(ctx.folder, category)
+    )
+    new_filename = make_new_filename(filepath)
+    dest = (
+        unique_path(os.path.join(dest_dir, new_filename))
+        if not ctx.dry_run
+        else os.path.join(dest_dir, new_filename)
+    )
+
+    already_in_place = os.path.dirname(filepath) == dest_dir
+    _log_action(filepath, dest, ctx.folder, is_dup, already_in_place)
+
+    if not ctx.dry_run:
+        if dest_dir not in ctx.created_dirs:
+            os.makedirs(dest_dir, exist_ok=True)
+            ctx.created_dirs.add(dest_dir)
+        shutil.move(filepath, dest)
+
+    if is_dup:
+        ctx.stats.duplicates += 1
+    elif already_in_place:
+        ctx.stats.renamed += 1
+    else:
+        ctx.stats.moved += 1
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +266,7 @@ def organize(folder: str, dry_run: bool = False) -> None:
       3. Build a clean, timestamped destination filename.
       4. Move/rename on disk unless *dry_run* is True.
 
-    Duplicates land in <category>/Duplicates/ — nothing is ever deleted.
+    Duplicates land in <category>/Duplicates/ - nothing is ever deleted.
     """
     folder = os.path.abspath(folder)
     if not os.path.isdir(folder):
@@ -228,63 +285,28 @@ def organize(folder: str, dry_run: bool = False) -> None:
         if f != script_name
     ]
 
-    seen_hashes: dict[str, str] = {}  # hash → first-seen filepath
-    created_dirs: set[str] = set()    # avoids redundant makedirs syscalls
-    stats = Stats()
+    ctx = _RunContext(
+        folder=folder,
+        dry_run=dry_run,
+        seen_hashes={},
+        created_dirs=set(),
+        stats=Stats(),
+    )
 
     for filepath in all_files:
-        # Guard against files that vanish between collection and processing —
-        # common on virtual/network mounts such as WSL ↔ Windows drives.
+        # Guard against files that vanish between collection and processing.
         if not os.path.isfile(filepath):
             continue
-
-        category  = get_category(filepath)
-        file_hash = get_file_hash(filepath)
-
-        is_dup = file_hash is not None and file_hash in seen_hashes
-        if file_hash and not is_dup:
-            seen_hashes[file_hash] = filepath
-
-        dest_dir = (
-            os.path.join(folder, category, DUPLICATES_DIR)
-            if is_dup
-            else os.path.join(folder, category)
-        )
-
-        new_filename = make_new_filename(filepath)
-        dest = (
-            unique_path(os.path.join(dest_dir, new_filename))
-            if not dry_run
-            else os.path.join(dest_dir, new_filename)
-        )
-
-        already_in_place = os.path.dirname(filepath) == dest_dir
-        tag    = "[DUP]  " if is_dup else "       "
-        action = "Rename" if already_in_place else "Move+Rename"
-        print(f"  {tag}{action}: {os.path.basename(filepath)}")
-        print(f"          -> {os.path.relpath(dest, folder)}")
-
-        if not dry_run:
-            if dest_dir not in created_dirs:
-                os.makedirs(dest_dir, exist_ok=True)
-                created_dirs.add(dest_dir)
-            shutil.move(filepath, dest)
-
-        if is_dup:
-            stats.duplicates += 1
-        elif already_in_place:
-            stats.renamed += 1
-        else:
-            stats.moved += 1
+        _process_file(filepath, ctx)
 
     if not dry_run:
         remove_empty_dirs(folder)
 
     prefix = "[DRY RUN] " if dry_run else ""
     print(f"\n{prefix}Done.")
-    print(f"  Moved     : {stats.moved}")
-    print(f"  Renamed   : {stats.renamed}")
-    print(f"  Duplicates: {stats.duplicates}")
+    print(f"  Moved     : {ctx.stats.moved}")
+    print(f"  Renamed   : {ctx.stats.renamed}")
+    print(f"  Duplicates: {ctx.stats.duplicates}")
     if dry_run:
         print("\nRun without --dry-run to apply changes.")
 
